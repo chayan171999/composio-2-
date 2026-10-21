@@ -176,15 +176,41 @@ async function withRetry<T>(
 }
 
 function assemble(draft: AgentGuide, composio: ComposioCheck): Guide {
+  // When the managed-OAuth answer comes from parsed data rather than the model,
+  // it arrives with no claim behind it — leaving the guide's most decision-relevant
+  // field as the one assertion a reader cannot check. This records how it was
+  // determined, citing the page the check actually read.
+  const claims = [...draft.claims];
+  const composioClaimIds = [...draft.composio.claimIds];
+
+  if (composio.authoritative && composio.source) {
+    const used = new Set(claims.map((claim) => claim.id));
+    let n = claims.length + 1;
+    while (used.has(`c${n}`)) n++;
+    const id = `c${n}`;
+
+    claims.push({
+      id,
+      text: composio.detail,
+      status: "sourced",
+      sources: [composio.source],
+    });
+    composioClaimIds.unshift(id);
+  }
+
   return {
     ...draft,
+    claims,
     composio: {
       ...draft.composio,
-      // This is the most decision-relevant field in the guide and the model was
-      // seen flipping it between runs, so the deterministic check wins. When that
-      // check could not confirm it, "unknown" is the honest answer — a confident
-      // wrong "no" is worse than admitting we do not know.
-      managedOAuth: composio.managedOAuth,
+      // Both the API and the public toolkit page expose composioManagedAuthSchemes
+      // directly, so when either was read the answer comes from data, not from a
+      // model's reading of a truncated excerpt — which got this backwards. The
+      // model's value only stands when neither could be parsed.
+      managedOAuth: composio.authoritative
+        ? composio.managedOAuth
+        : draft.composio.managedOAuth,
+      claimIds: composioClaimIds,
     },
     slug: slugify(draft.appName),
     lastChecked: new Date().toISOString().slice(0, 10),
@@ -294,12 +320,11 @@ export async function* generateGuide(query: string): AsyncGenerator<ProgressEven
   }
   if (candidates.length === 0) throw new Error("No candidate documentation URLs found.");
 
-  // Discovery proposes provider documentation only, so Composio's own toolkit page
-  // has to be added explicitly — without it the model cannot resolve the managed
-  // OAuth question and has been seen reporting "no" where the answer is "yes".
-  const toRead = composio.source?.url
-    ? [composio.source.url, ...candidates]
-    : candidates;
+  // The Composio page is half a megabyte and its managed-auth field is already
+  // parsed by checkComposio, so it is not re-fetched here — that spent one of only
+  // four document slots to show the model an unrelated FAQ excerpt. It is still
+  // citable below, because the check genuinely retrieved it.
+  const toRead = candidates;
   for (const url of toRead) yield { type: "fetch", url };
 
   // Pages are fetched here rather than by a model tool, so the citation
@@ -320,6 +345,7 @@ export async function* generateGuide(query: string): AsyncGenerator<ProgressEven
     url: doc.finalUrl,
     title: doc.title,
   }));
+  if (composio.source) sources.push(composio.source);
   const allowedUrls = new Set(sources.map((source) => source.url));
 
   yield { type: "stage", message: "Synthesising the guide…" };

@@ -35,6 +35,7 @@ async function checkViaApi(
   return {
     managedOAuth: list.length === 0 ? "no" : hasOAuth ? "yes" : "no",
     method: "api",
+    authoritative: true,
     toolkitSlug: slug,
     source: {
       url: `${DOCS_BASE}/${slug}`,
@@ -44,17 +45,62 @@ async function checkViaApi(
   };
 }
 
+/**
+ * The public toolkit page embeds the same field the authenticated API returns —
+ * composioManagedAuthSchemes — in its page data, and states it in prose as
+ * "Composio-managed OAuth available". Reading it here means the answer is
+ * deterministic without any credential.
+ *
+ * A model was previously asked to judge this from a page excerpt and got it
+ * backwards: the page is over 500k characters, so the excerpt it saw was the FAQ
+ * entry about setting up *custom* credentials, not the auth summary.
+ */
+function readManagedSchemes(html: string): string[] | null {
+  // Matches both the raw and the backslash-escaped form the page ships.
+  const field = html.match(
+    /composioManagedAuthSchemes\\?"\s*:\s*\[([^\]]*)\]/i,
+  )?.[1];
+
+  if (field !== undefined) {
+    const schemes = [...field.matchAll(/([A-Z][A-Z0-9_]+)/g)].map((m) => m[1]);
+    return schemes;
+  }
+
+  if (/Composio-managed OAuth available/i.test(html)) return ["OAUTH2"];
+  return null;
+}
+
 async function checkViaDocs(slug: string): Promise<ComposioCheck | null> {
   const url = `${DOCS_BASE}/${slug}`;
-  const response = await fetch(url, { method: "GET" });
+  const response = await fetch(url, {
+    method: "GET",
+    signal: AbortSignal.timeout(15_000),
+  });
   if (!response.ok) return null;
 
+  const schemes = readManagedSchemes(await response.text());
+  const source = { url, title: `Composio — ${slug} toolkit` };
+
+  // No match means the page shape changed. Say "unknown" rather than guess.
+  if (schemes === null) {
+    return {
+      managedOAuth: "unknown",
+      method: "docs",
+      authoritative: false,
+      toolkitSlug: slug,
+      source,
+      detail: `A Composio toolkit page exists at ${url}, but its managed-auth field could not be read. Treat the managed OAuth status as unconfirmed.`,
+    };
+  }
+
+  const hasOAuth = schemes.some((scheme) => scheme.toUpperCase().includes("OAUTH"));
   return {
-    managedOAuth: "unknown",
+    managedOAuth: hasOAuth ? "yes" : "no",
     method: "docs",
+    authoritative: true,
     toolkitSlug: slug,
-    source: { url, title: `Composio — ${slug} toolkit docs` },
-    detail: `No Composio API key configured. A toolkit docs page exists at ${url}; managed OAuth status must be read from that page and labelled "sourced", not "tested".`,
+    source,
+    detail: `Composio's public toolkit page lists composioManagedAuthSchemes: [${schemes.join(", ") || "none"}] for "${slug}", so Composio-managed OAuth is ${hasOAuth ? "available" : "not available"} for this toolkit.`,
   };
 }
 
@@ -63,9 +109,13 @@ export async function checkComposio(candidates: string[]): Promise<ComposioCheck
 
   for (const slug of candidates) {
     try {
-      const result = apiKey
-        ? await checkViaApi(slug, apiKey)
-        : await checkViaDocs(slug);
+      // An API key that is rejected — the wrong key type, say, or a revoked one —
+      // used to end the check here, which was worse than having no key at all:
+      // the docs page never got looked up, so the agent lost the one page that
+      // could answer the managed-OAuth question.
+      const result =
+        (apiKey ? await checkViaApi(slug, apiKey) : null) ??
+        (await checkViaDocs(slug));
       if (result) return result;
     } catch {
       // Network failures fall through to the next candidate, then to "unknown".
@@ -75,8 +125,7 @@ export async function checkComposio(candidates: string[]): Promise<ComposioCheck
   return {
     managedOAuth: "unknown",
     method: "none",
-    detail: apiKey
-      ? `No Composio toolkit matched any of: ${candidates.join(", ")}.`
-      : `No Composio API key configured and no toolkit docs page matched any of: ${candidates.join(", ")}.`,
+    authoritative: false,
+    detail: `No Composio toolkit matched any of: ${candidates.join(", ")}. Managed OAuth status could not be confirmed.`,
   };
 }

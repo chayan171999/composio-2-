@@ -10,6 +10,8 @@ export type ProgressEvent =
 export type ComposioCheck = {
   managedOAuth: "yes" | "no" | "unknown";
   method: "api" | "docs" | "none";
+  /** True when the status was read from data rather than inferred by a model. */
+  authoritative: boolean;
   toolkitSlug?: string;
   source?: { url: string; title: string };
   detail: string;
