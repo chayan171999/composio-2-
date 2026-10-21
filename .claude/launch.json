@@ -1,11 +1,6 @@
 {
   "version": "0.0.1",
   "configurations": [
-    {
-      "name": "composio-oauth-guides",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
-      "port": 3000
-    }
+    { "name": "composio-2", "runtimeExecutable": "npm", "runtimeArgs": ["run", "dev"], "port": 3200 }
   ]
 }

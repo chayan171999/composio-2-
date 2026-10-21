@@ -1,4 +1,3 @@
-import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 import {
   actorSchema,
@@ -11,40 +10,40 @@ import {
   type Source,
 } from "@/lib/schema";
 import { checkComposio, toolkitSlugCandidates } from "./composio";
+import { fetchDocs } from "./fetchDocs";
+import { GroqError, groqChat, type GroqMessage } from "./groq";
 import {
   DISCOVERY_SYSTEM,
-  RESEARCH_SYSTEM,
   SYNTHESIS_SYSTEM,
   discoveryPrompt,
   repairPrompt,
-  researchPrompt,
   synthesisPrompt,
 } from "./prompts";
-import type { ProgressEvent } from "./types";
+import type { ComposioCheck, ProgressEvent } from "./types";
 
-// Flash-Lite's free tier allows roughly 500 requests/day against Flash's ~20, so the
-// cheap model handles listing candidate URLs. Reading those pages and labelling each
-// claim's evidence stays on Flash: measured side by side on the same app, Flash-Lite
-// produced 5 sourced claims where Flash produced 9, and marked facts "unverified"
-// that Flash correctly cited.
-const MODEL = process.env.GEMINI_MODEL ?? "gemini-3.5-flash";
-const DISCOVERY_MODEL = process.env.GEMINI_DISCOVERY_MODEL ?? "gemini-3.1-flash-lite";
-const DISCOVERY_MAX_TOKENS = 4000;
-const RESEARCH_MAX_TOKENS = 16000;
-const SYNTHESIS_MAX_TOKENS = 32000;
+const MODEL = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
+// gpt-oss-20b proposed 5 URLs on one run and 1 on the next, which swung a guide
+// from 15 claims to 7. Discovery is a ~700 token call, so it uses the stronger
+// model rather than the cheap one.
+const DISCOVERY_MODEL = process.env.GROQ_DISCOVERY_MODEL ?? "openai/gpt-oss-120b";
+const MIN_URLS = 3;
+// gpt-oss models emit reasoning tokens that count against max_tokens, so a tight
+// ceiling truncates the JSON mid-structure and Groq rejects the whole response.
+// Discovery needs ~1.1k; synthesis needs room for a full guide plus reasoning.
+const DISCOVERY_MAX_TOKENS = 2500;
+// The free tier caps a whole request at 8k tokens, and max_tokens counts toward
+// it, so the output ceiling has to leave room for the system prompt and pages.
+const SYNTHESIS_MAX_TOKENS = 4200;
+const MAX_DOCS_IN_PROMPT = 4;
 const MAX_URLS = 6;
+// The free tier meters 8k tokens/minute, so a 429 here is a pace limit that
+// clears shortly rather than a daily ceiling.
 const RETRY_ATTEMPTS = 4;
-const RETRY_BASE_MS = 2000;
-// Kept under the route's maxDuration so a stuck generation surfaces as a real error
-// rather than an opaque platform timeout. The per-call ceiling has to clear the
-// documentation-reading call, which fetches every candidate page and runs far slower
-// deployed than it does locally.
+const RETRY_BASE_MS = 3000;
+const MAX_RETRY_MS = 65_000;
 const WALL_CLOCK_MS = 165_000;
-const PER_CALL_TIMEOUT_MS = 115_000;
+const PER_CALL_TIMEOUT_MS = 110_000;
 
-// Mirrors guideSchema minus the fields set in code, and without refinements —
-// JSON Schema cannot express those. The result is re-validated against the real
-// guideSchema afterwards.
 const agentGuideSchema = z.object({
   appName: z.string(),
   aliases: z.array(z.string()),
@@ -106,7 +105,9 @@ const agentGuideSchema = z.object({
       id: z.string(),
       text: z.string(),
       status: claimStatusSchema,
-      sources: z.array(sourceSchema),
+      // Models routinely omit this on claims that have no sources, which is a
+      // correct thing to mean. validate() still rejects a "sourced" claim with none.
+      sources: z.array(sourceSchema).default([]),
       note: z.string().optional(),
     }),
   ),
@@ -115,20 +116,9 @@ const agentGuideSchema = z.object({
 
 type AgentGuide = z.infer<typeof agentGuideSchema>;
 
-// Gemini's responseJsonSchema rejects $schema and additionalProperties.
-function stripUnsupportedKeywords(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(stripUnsupportedKeywords);
-  if (node && typeof node === "object") {
-    return Object.fromEntries(
-      Object.entries(node as Record<string, unknown>)
-        .filter(([key]) => key !== "$schema" && key !== "additionalProperties")
-        .map(([key, value]) => [key, stripUnsupportedKeywords(value)]),
-    );
-  }
-  return node;
-}
-
-const responseJsonSchema = stripUnsupportedKeywords(z.toJSONSchema(agentGuideSchema));
+const discoverySchema = z.object({
+  urls: z.array(z.object({ url: z.string(), topic: z.string().optional() })),
+});
 
 function slugify(value: string): string {
   return value
@@ -138,15 +128,14 @@ function slugify(value: string): string {
     .slice(0, 60);
 }
 
-const discoverySchema = z.object({
-  urls: z.array(z.object({ url: z.string(), topic: z.string() })),
-});
+function parseJson(text: string): unknown {
+  const trimmed = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("Model did not return JSON.");
+  return JSON.parse(trimmed.slice(start, end + 1));
+}
 
-const discoveryJsonSchema = stripUnsupportedKeywords(z.toJSONSchema(discoverySchema));
-
-// The free tier returns 503 UNAVAILABLE ("high demand") and 429 often enough that a
-// single attempt frequently fails. Both are transient here, unlike the hard 429 that
-// googleSearch grounding returns for having no free quota at all.
 async function withRetry<T>(
   label: string,
   call: (signal: AbortSignal) => Promise<T>,
@@ -168,22 +157,17 @@ async function withRetry<T>(
       if (deadline.aborted) {
         throw new Error(`${label} ran out of time (${WALL_CLOCK_MS / 1000}s budget).`);
       }
-      const message = String(error instanceof Error ? error.message : error);
-
-      // A daily-quota 429 names the free-tier metric and asks for a wait measured in
-      // minutes, so retrying only burns the time budget. Surface it instead.
-      if (/free_tier_requests|PerDay/.test(message)) {
-        const minutes = message.match(/retry in (\d+)m/)?.[1];
-        throw new Error(
-          `Daily free-tier quota exhausted for ${MODEL}.${minutes ? ` Resets in about ${minutes} minutes.` : ""} Seed guides still work; generation needs a fresh quota window or a billed key.`,
-        );
-      }
-
-      const retryable = /"code":\s*(503|429)/.test(message);
+      const retryable = error instanceof GroqError && error.retryable;
       if (!retryable || attempt === RETRY_ATTEMPTS) break;
 
-      const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
-      onRetry(`${label} hit a transient error — retrying in ${delay / 1000}s…`);
+      const asked =
+        error instanceof GroqError && error.retryAfterSec
+          ? Math.ceil(error.retryAfterSec * 1000) + 500
+          : 0;
+      const delay = Math.min(Math.max(asked, RETRY_BASE_MS * attempt), MAX_RETRY_MS);
+      onRetry(
+        `${label} hit the per-minute token limit — waiting ${Math.round(delay / 1000)}s…`,
+      );
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
@@ -191,19 +175,17 @@ async function withRetry<T>(
   throw lastError;
 }
 
-function titleFromUrl(url: string): string {
-  try {
-    const { hostname, pathname } = new URL(url);
-    const last = pathname.split("/").filter(Boolean).pop();
-    return last ? `${hostname} — ${last.replace(/[-_]/g, " ")}` : hostname;
-  } catch {
-    return url;
-  }
-}
-
-function assemble(draft: AgentGuide): Guide {
+function assemble(draft: AgentGuide, composio: ComposioCheck): Guide {
   return {
     ...draft,
+    composio: {
+      ...draft.composio,
+      // This is the most decision-relevant field in the guide and the model was
+      // seen flipping it between runs, so the deterministic check wins. When that
+      // check could not confirm it, "unknown" is the honest answer — a confident
+      // wrong "no" is worse than admitting we do not know.
+      managedOAuth: composio.managedOAuth,
+    },
     slug: slugify(draft.appName),
     lastChecked: new Date().toISOString().slice(0, 10),
     generatedBy: "agent",
@@ -256,7 +238,7 @@ function validate(guide: Guide, allowedUrls: Set<string>): string[] {
     for (const source of claim.sources) {
       if (!allowedUrls.has(source.url)) {
         errors.push(
-          `claims.${claim.id}: source "${source.url}" was not among the pages actually retrieved — cite only the listed sources`,
+          `claims.${claim.id}: source "${source.url}" was not among the pages fetched — cite only the listed sources`,
         );
       }
     }
@@ -265,41 +247,33 @@ function validate(guide: Guide, allowedUrls: Set<string>): string[] {
   return errors;
 }
 
-async function parseJson(text: string): Promise<unknown> {
-  const trimmed = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
-  return JSON.parse(trimmed);
-}
-
 export async function* generateGuide(query: string): AsyncGenerator<ProgressEvent> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
-  const ai = new GoogleGenAI({ apiKey });
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error("GROQ_API_KEY is not configured.");
+
   const deadline = AbortSignal.timeout(WALL_CLOCK_MS);
-
-  yield { type: "stage", message: `Resolving "${query}"…` };
-  yield { type: "stage", message: "Checking Composio managed auth…" };
-  const composio = await checkComposio(toolkitSlugCandidates(query));
-
-  // withRetry cannot yield, so retry notices are buffered and drained after each call.
   const notices: string[] = [];
   const note = (message: string) => void notices.push(message);
   const drain = (): ProgressEvent[] =>
     notices.splice(0).map((message) => ({ type: "warning", message }));
 
+  yield { type: "stage", message: `Resolving "${query}"…` };
+  yield { type: "stage", message: "Checking Composio managed auth…" };
+  const composio = await checkComposio(toolkitSlugCandidates(query));
+
   yield { type: "stage", message: "Finding official documentation…" };
   const discovery = await withRetry(
     "Discovery",
     (signal) =>
-      ai.models.generateContent({
+      groqChat(apiKey, {
         model: DISCOVERY_MODEL,
-        contents: discoveryPrompt(query),
-        config: {
-          systemInstruction: DISCOVERY_SYSTEM,
-          maxOutputTokens: DISCOVERY_MAX_TOKENS,
-          responseMimeType: "application/json",
-          responseJsonSchema: discoveryJsonSchema,
-          abortSignal: signal,
-        },
+        maxTokens: DISCOVERY_MAX_TOKENS,
+        json: true,
+        signal,
+        messages: [
+          { role: "system", content: DISCOVERY_SYSTEM },
+          { role: "user", content: discoveryPrompt(query) },
+        ],
       }),
     note,
     deadline,
@@ -307,84 +281,88 @@ export async function* generateGuide(query: string): AsyncGenerator<ProgressEven
   yield* drain();
 
   const candidates = discoverySchema
-    .parse(await parseJson(discovery.text ?? ""))
+    .parse(parseJson(discovery.text))
     .urls.map((entry) => entry.url)
     .filter((url) => /^https?:\/\//.test(url))
     .slice(0, MAX_URLS);
 
-  if (candidates.length === 0) throw new Error("No candidate documentation URLs found.");
-  for (const url of candidates) yield { type: "fetch", url };
-
-  yield { type: "stage", message: "Reading documentation…" };
-  const research = await withRetry(
-    "Reading documentation",
-    (signal) =>
-      ai.models.generateContent({
-        model: MODEL,
-        contents: researchPrompt(query, composio, candidates),
-        config: {
-          systemInstruction: RESEARCH_SYSTEM,
-          maxOutputTokens: RESEARCH_MAX_TOKENS,
-          tools: [{ urlContext: {} }],
-          abortSignal: signal,
-        },
-      }),
-    note,
-    deadline,
-  );
-  yield* drain();
-
-  const brief = research.text ?? "";
-  if (!brief.trim()) throw new Error("Research produced no usable notes.");
-
-  // urlContextMetadata is the authoritative record of what was actually fetched, so
-  // the citation allow-list is built from retrieval successes rather than from the
-  // URLs we asked for.
-  const sources: Source[] = [];
-  for (const entry of research.candidates?.[0]?.urlContextMetadata?.urlMetadata ?? []) {
-    const url = entry.retrievedUrl;
-    const ok = entry.urlRetrievalStatus === "URL_RETRIEVAL_STATUS_SUCCESS";
-    if (!url) continue;
-    yield { type: "fetch", url, ok };
-    if (ok && !sources.some((source) => source.url === url)) {
-      sources.push({ url, title: titleFromUrl(url) });
-    }
-  }
-
-  if (sources.length === 0) {
+  if (candidates.length < MIN_URLS) {
     yield {
       type: "warning",
-      message: "No pages could be retrieved — every claim will be inferred or unverified.",
+      message: `Discovery returned only ${candidates.length} URL(s) — the guide may be thin.`,
     };
   }
+  if (candidates.length === 0) throw new Error("No candidate documentation URLs found.");
+
+  // Discovery proposes provider documentation only, so Composio's own toolkit page
+  // has to be added explicitly — without it the model cannot resolve the managed
+  // OAuth question and has been seen reporting "no" where the answer is "yes".
+  const toRead = composio.source?.url
+    ? [composio.source.url, ...candidates]
+    : candidates;
+  for (const url of toRead) yield { type: "fetch", url };
+
+  // Pages are fetched here rather than by a model tool, so the citation
+  // allow-list is built from HTTP statuses we saw ourselves.
+  yield { type: "stage", message: "Reading documentation…" };
+  const docs = await fetchDocs(toRead);
+  for (const url of toRead) {
+    const hit = docs.find((doc) => doc.url === url);
+    yield { type: "fetch", url: hit?.finalUrl ?? url, ok: Boolean(hit) };
+  }
+
+  if (docs.length === 0) {
+    throw new Error("None of the candidate documentation pages could be read.");
+  }
+
+  const used = docs.slice(0, MAX_DOCS_IN_PROMPT);
+  const sources: Source[] = used.map((doc) => ({
+    url: doc.finalUrl,
+    title: doc.title,
+  }));
   const allowedUrls = new Set(sources.map((source) => source.url));
 
   yield { type: "stage", message: "Synthesising the guide…" };
-  const synthesisConfig = {
-    systemInstruction: SYNTHESIS_SYSTEM,
-    maxOutputTokens: SYNTHESIS_MAX_TOKENS,
-    responseMimeType: "application/json",
-    responseJsonSchema,
-  };
+  const baseMessages: GroqMessage[] = [
+    { role: "system", content: SYNTHESIS_SYSTEM },
+    { role: "user", content: synthesisPrompt(query, composio, used) },
+  ];
 
   const response = await withRetry(
     "Synthesis",
     (signal) =>
-      ai.models.generateContent({
+      groqChat(apiKey, {
         model: MODEL,
-        contents: synthesisPrompt(query, composio, brief, sources),
-        config: { ...synthesisConfig, abortSignal: signal },
+        maxTokens: SYNTHESIS_MAX_TOKENS,
+        json: true,
+        signal,
+        messages: baseMessages,
       }),
     note,
     deadline,
   );
   yield* drain();
 
-  let draft = agentGuideSchema.parse(await parseJson(response.text ?? ""));
-
   yield { type: "stage", message: "Validating claims…" };
-  let guide = assemble(draft);
-  let errors = validate(guide, allowedUrls);
+
+  // Groq's JSON mode does not enforce a schema, so a malformed field is likely
+  // enough that shape errors have to reach the repair pass rather than throwing.
+  // The previous code parsed strictly here, which meant repair only ever saw
+  // citation and claim-reference problems.
+  let draft: AgentGuide | null = null;
+  let guide: Guide | null = null;
+  let errors: string[] = [];
+
+  const first = agentGuideSchema.safeParse(parseJson(response.text));
+  if (first.success) {
+    draft = first.data;
+    guide = assemble(draft, composio);
+    errors = validate(guide, allowedUrls);
+  } else {
+    errors = first.error.issues.map(
+      (issue) => `${issue.path.join(".")}: ${issue.message}`,
+    );
+  }
 
   if (errors.length > 0) {
     yield {
@@ -394,29 +372,38 @@ export async function* generateGuide(query: string): AsyncGenerator<ProgressEven
     const repair = await withRetry(
       "Repair",
       (signal) =>
-        ai.models.generateContent({
+        groqChat(apiKey, {
           model: MODEL,
-          contents: [
-            { role: "user", parts: [{ text: synthesisPrompt(query, composio, brief, sources) }] },
-            { role: "model", parts: [{ text: JSON.stringify(draft) }] },
-            { role: "user", parts: [{ text: repairPrompt(errors.join("\n")) }] },
+          maxTokens: SYNTHESIS_MAX_TOKENS,
+          json: true,
+          signal,
+          messages: [
+            { role: "system", content: SYNTHESIS_SYSTEM },
+            {
+              role: "assistant",
+              content: draft ? JSON.stringify(draft) : response.text,
+            },
+            { role: "user", content: repairPrompt(errors.join("\n"), sources) },
           ],
-          config: { ...synthesisConfig, abortSignal: signal },
         }),
       note,
       deadline,
     );
     yield* drain();
 
-    const repaired = agentGuideSchema.safeParse(await parseJson(repair.text ?? ""));
+    const repaired = agentGuideSchema.safeParse(parseJson(repair.text));
     if (repaired.success) {
       draft = repaired.data;
-      guide = assemble(draft);
+      guide = assemble(draft, composio);
       errors = validate(guide, allowedUrls);
+    } else {
+      errors = repaired.error.issues.map(
+        (issue) => `${issue.path.join(".")}: ${issue.message}`,
+      );
     }
   }
 
-  if (errors.length > 0) {
+  if (!guide || errors.length > 0) {
     throw new Error(`Generated guide failed validation:\n${errors.slice(0, 8).join("\n")}`);
   }
 
