@@ -70,7 +70,28 @@ rejected and sent back for one repair pass:
 - A `sourced` claim must cite at least one URL, and that URL must be one the agent
   actually retrieved.
 
-## Model selection
+## Agent implementation
+
+This repository runs the agent on Groq, fetching documentation pages in its own
+code. The model-selection notes below were recorded against the first
+implementation, which used Gemini; they are kept because they are what motivated
+splitting cheap and quality-critical steps, and the same reasoning applies here.
+
+**The Composio managed-auth check needs no API key.** Composio's public toolkit
+page embeds `composioManagedAuthSchemes`, the same field the authenticated API
+returns, so the answer is parsed from data. Asking a model to read it from a page
+excerpt produced the wrong answer consistently: the page is over 500k characters
+and the 2.2k excerpt window landed on the FAQ entry about configuring *custom*
+credentials. Verified correct against slack, zoom, notion, github, gmail, figma
+and linear; an unknown slug 404s and returns "unknown" rather than a guess.
+
+**A guide can miss a blocker.** Groq's free tier caps a request at 8k tokens
+including output, so at most four pages of ~550 tokens reach the model. On one
+Zoom run the agent reported `blocker: none` where the honest answer is
+`scope_review`, having not retrieved the Marketplace review pages. This is the
+clearest known quality cost of the tighter budget.
+
+## Model selection (first implementation, Gemini)
 
 **Flash-Lite was measured and rejected for the quality-critical steps.** The same
 app (Slack) was generated twice, once entirely on `gemini-3.5-flash` and once

@@ -1,6 +1,6 @@
 # Do you need your own OAuth app?
 
-**Live: https://composio-oauth-guides.vercel.app**
+**Live: https://composio-2.vercel.app**
 
 A developer building on Composio hits a question that is surprisingly hard to
 answer: *do I need to register my own OAuth app with this provider, and if so,
@@ -18,31 +18,38 @@ This looks an app up and answers, in about thirty seconds:
 
 Three guides are hand-verified. Anything else is researched live by an agent.
 
+> This is the second implementation. The first runs the same product on the
+> Gemini API, whose free tier allows ~20 model requests a day — about five
+> generations before the demo stops working. This one runs on Groq and fetches
+> documentation itself, which is roughly six times faster per guide and lifts the
+> ceiling from a daily wall to a per-minute pace. The trade-off is real and is
+> described under [Limits](#limits).
+
 ---
 
 ## Quick start
 
 ```bash
 npm install
-cp .env.example .env.local   # then fill in GEMINI_API_KEY
+cp .env.example .env.local   # then fill in GROQ_API_KEY
 npm run dev
 ```
 
-Only `GEMINI_API_KEY` is required — get a free one at
-[aistudio.google.com/apikey](https://aistudio.google.com/apikey), no billing
-account needed. Everything else is optional:
+Only `GROQ_API_KEY` is required — free at
+[console.groq.com/keys](https://console.groq.com/keys), no billing account.
+Everything else is optional:
 
 | Variable | Purpose |
 | --- | --- |
-| `GEMINI_API_KEY` | **Required.** Powers the agent. Server-side only; never sent to the browser. |
-| `GEMINI_MODEL` | Model that reads docs and labels evidence. Default `gemini-3.5-flash`. |
-| `GEMINI_DISCOVERY_MODEL` | Model that lists candidate doc URLs. Default `gemini-3.1-flash-lite`. |
+| `GROQ_API_KEY` | **Required.** Powers the agent. Server-side only; never sent to the browser. |
+| `GROQ_MODEL` | Model that reads documentation and labels evidence. Default `openai/gpt-oss-120b`. |
+| `GROQ_DISCOVERY_MODEL` | Model that lists candidate documentation URLs. Default `openai/gpt-oss-120b`. |
 | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | Upstash Redis, so generated guides get shareable URLs. Provisioned automatically by Vercel's Upstash integration. |
-| `COMPOSIO_API_KEY` | Reads managed-auth status from Composio's API instead of its public docs. |
+| `COMPOSIO_API_KEY` | Not needed. The managed-auth check reads Composio's public toolkit page instead; see below. |
 
 Without Upstash, generated guides fall back to a local `.data/` file. That works
-in development but **not** on Vercel, whose filesystem is read-only — generated
-URLs would 404 for anyone you shared them with.
+in development but **not** on Vercel, whose filesystem is read-only — a generated
+guide will render once and then be gone.
 
 ---
 
@@ -51,110 +58,104 @@ URLs would 404 for anyone you shared them with.
 **The blocker type and the critical path lead the guide.** Most integration docs
 are ordered by the provider's process. That is the wrong order for someone
 deciding whether to start. What a developer needs first is the shape of the
-obstacle — *no review*, *scope review*, *business verification* — because that
-determines whether this is an afternoon or a quarter. The critical path comes
-next and is capped at four items, all chosen so approval waits run in parallel
-with building. Steps come after; by then you have already decided.
+obstacle, because that determines whether this is an afternoon or a quarter. The
+critical path follows, capped at four items chosen so approval waits run in
+parallel with building.
 
 **Composio's managed status is the first question, not a footnote.** The most
-valuable answer this can give is often "you don't need to do any of this." The
-verdict leads with that, so the guide can talk you out of the work.
+valuable answer this can give is often "you don't need to do any of this."
 
 **Evidence is per-claim, not per-page.** A guide that is 90% accurate is
 dangerous if you cannot tell which 90%. Every factual statement is a claim with
-an id, a status (`tested` / `sourced` / `inferred` / `unverified`), and its
-sources. Claim references render as footnote markers; hovering one shows the
-statement, its sources, and the date it was checked. An estimate never renders
-as a confirmed fact.
+an id, a status (`tested` / `sourced` / `inferred` / `unverified`), its sources,
+and the date checked. An estimate never renders as confirmed fact.
 
 **Only three seed guides, on purpose.** The slow part is not writing the JSON —
-it is reading primary sources and being honest about what they do and do not
-say. Three guides that are genuinely verified demonstrate the evidence model
-better than twenty that are plausible. They were chosen to cover three different
-blocker types: GitHub needs no review at all, Google gates on which scopes you
-request, Meta gates on your legal identity.
+it is reading primary sources and being honest about what they do and do not say.
+They cover three different blocker types: GitHub needs no review, Google gates on
+which scopes you request, Meta gates on your legal identity.
 
 **Nothing an agent produces may claim to be `tested`.** That status is reserved
-for things a human actually did. Validation rejects it outright on generated
-guides, so the distinction cannot erode as the library grows.
+for things a human actually did, and validation rejects it outright.
 
 ---
 
 ## How the agent works
 
-Three model calls, bounded, streamed to the browser over SSE as it goes.
+Two model calls and a fetch, streamed to the browser over SSE.
 
-1. **Discovery** — given an app name, propose up to 6 likely official
-   documentation URLs. This is a mechanical task, so it runs on the cheaper
-   Flash-Lite model.
-2. **Read** — fetch those pages with Gemini's URL-context tool and write a
-   research brief with a source line per fact. Gemini reports which URLs were
-   actually retrieved, which matters for the next step.
-3. **Composio check** — done in code, not by the model: the Composio API when a
-   key is configured, otherwise the public toolkit docs page.
-4. **Synthesise** — turn the brief into the guide schema as structured JSON,
-   validated with Zod. On failure the errors are fed back for one repair attempt.
+1. **Discovery** — propose up to 6 likely official documentation URLs for the app.
+2. **Fetch** — retrieve those pages **in our own code**, strip the HTML, and keep
+   the part that talks about registration, scopes and review.
+3. **Composio check** — read `composioManagedAuthSchemes` from Composio's public
+   toolkit page. Deterministic, and needs no API key.
+4. **Synthesise** — turn the page text into the guide schema as JSON, validated
+   with Zod, with one repair attempt on failure.
+
+### Why it fetches pages itself
+
+Groq's Compound systems carry a Visit Website tool, but they are not available on
+a free account. `browser_search` is, and it works — but it costs about **65,000
+tokens per call** against an **8,000-token per-request cap**, roughly fifty times
+what fetching the same page costs directly.
+
+Doing the retrieval ourselves turned out better than a provider tool anyway:
+
+- The citation allow-list is built from **HTTP statuses we saw**, not a model's
+  report of what it read.
+- Nothing depends on one vendor's retrieval feature, so changing model is a
+  config change.
 
 ### What stops it inventing things
 
-Prompting alone is not a guarantee, so the constraints are enforced in code:
+Prompting is not a guarantee, so the constraints are enforced in code:
 
-- **Citations are an allow-list.** It is built from Gemini's record of which
-  pages were *actually fetched*, so a URL that 404'd cannot be cited — the model
-  cannot invent a plausible-looking docs link. In the Zoom run, four of eight
-  proposed URLs failed; the missing topics became open questions instead of
-  invented facts.
-- **`tested` is rejected** on generated guides.
-- **Dangling claim references are rejected** — every `claimIds` entry must
-  resolve to a claim that exists.
-- **A `sourced` claim must cite a source**, and that source must be on the
-  allow-list.
+- **Citations are an allow-list** built from the pages that actually returned 200.
+  A URL that 404s cannot be cited.
+- **Generated guides may never claim `tested`.**
+- **Dangling claim references are rejected** — every reference must resolve.
+- **A `sourced` claim must cite a source**, and that source must be on the list.
 
-Anything that fails goes back for one repair pass. If it still fails, the
-generation errors rather than shipping a guide that quietly breaks its own rules.
+Anything failing these goes back for one repair pass, which sees schema errors as
+well as citation ones — Groq's JSON mode does not enforce a schema, so malformed
+output is common enough that it has to be repairable rather than fatal.
 
-### Caps
+### The Composio check needs no credential
 
-Reviewers run this live, so each generation is bounded: 6 documentation URLs,
-a 115s per-call ceiling inside a 165s overall budget, bounded output tokens, and
-5 generations per IP per 10 minutes.
+Composio's public toolkit page embeds `composioManagedAuthSchemes` — the same
+field the authenticated API returns — so the answer is read from data rather than
+inferred. Asking a model to judge it from a page excerpt got it **backwards**:
+that page is over 500k characters, the excerpt window is 2.2k, and what the model
+saw was the FAQ entry about setting up *custom* credentials.
+
+The parsed answer carries its own sourced claim naming the field and the page, so
+a reader can check it. If the field cannot be parsed the check returns `unknown`
+rather than guessing.
 
 ---
 
 ## Limits
 
-**Free-tier quota is the binding constraint.** Gemini's free tier allows roughly
-**20 requests per day** on Flash. At 2–3 Flash calls per generation that is about
-**5–7 generations per day**. Seed guides and previously generated guides cost
-nothing to view, which is most of why persistence matters. When quota runs out,
-generation fails with a message saying when it resets; the rest of the site
-keeps working.
+**Requests are capped at 8,000 tokens, including the output.** This is the
+binding constraint and it shapes the whole design: documentation excerpts are
+trimmed to ~550 tokens each and at most four pages reach the model. That is less
+raw material than the Gemini implementation reads, and it shows — on one Zoom run
+the agent reported `blocker: none` where the honest answer is `scope_review`,
+having not retrieved the Marketplace review pages. **A guide can miss a blocker.**
 
-**Free-tier Gemini is flaky under load.** Transient `503 high demand` responses
-are common on the heavier document-reading call — one successful run absorbed
-three of them. Calls retry with backoff, but a reviewer may still need to try
-twice.
+**Rate limits are per-minute, not per-day.** A generation costs roughly 6–8k
+tokens, so the practical pace is about one a minute, indefinitely. Retries wait
+as long as the server asks rather than guessing a backoff.
 
 **The rate limiter is per-process.** On Vercel each serverless instance keeps its
-own counter, so the real limit is looser than it looks. It stops one tab
-hammering the agent; it is not a real abuse control.
+own counter, so the real limit is looser than it looks.
 
-**There is no self-review pass.** The brief listed one as optional. It is not
-built. Hallucination is mitigated structurally — by the retrieval allow-list and
-schema validation described above — rather than by asking a second model whether
-the first one was honest.
+**There is no self-review pass.** Hallucination is mitigated structurally, by the
+allow-list and schema validation above, rather than by asking a second model
+whether the first was honest.
 
 **Generated guides are not hand-checked.** They are labelled as machine-extracted
-with the date, and the evidence is there to audit, but only one has been verified
-line-by-line against its sources.
-
-**The model split is measured on one side only.** Running the whole pipeline on
-Flash-Lite was compared against Flash on the same app, and it was clearly worse:
-5 sourced claims against 9, with facts marked `unverified` that Flash cited
-correctly from the same pages. That is why only the mechanical URL-discovery step
-runs on Flash-Lite. The current split has **not** been compared against the
-all-Flash baseline — quota ran out mid-run — so it is reasoned from that
-measurement rather than verified end to end.
+with the date, and the evidence is there to audit.
 
 **Agent/human step classification is the model's judgement.** It follows an
 explicit rule — anything needing login, 2FA, CAPTCHA, legal entity details,
@@ -164,75 +165,50 @@ payment or a review submission is human — but it is not verified per step.
 
 ## Deviations from the brief
 
-**Gemini instead of the Anthropic API.** The brief specified Anthropic with its
-server-side web search tool, and it was built that way first. It was switched
-because the Anthropic API has no free tier, and a key requirement was avoiding
-paid accounts.
+**Groq instead of the Anthropic API.** The brief specified Anthropic with its
+server-side web search tool. Anthropic has no free tier, and avoiding paid
+accounts was a harder constraint. The first implementation moved to Gemini for
+that reason; this one moved to Groq because Gemini's ~20 requests/day made the
+live demo fragile.
 
-**URL retrieval instead of web search.** The obvious Gemini equivalent, Google
-Search grounding, returns a hard `429` on keys without billing — it has no free
-quota at all. So the agent discovers candidate documentation URLs and fetches
-them directly instead of searching. This turned out better for this use case:
-Gemini reports exactly which URLs it retrieved, which is what makes the citation
-allow-list possible. Searching would have given the model a pile of results to
-summarise and no way to prove which page a claim came from.
+**Our own fetching instead of a search tool.** Covered above: the free retrieval
+tools are either unavailable or cost 50× what a direct fetch does, and doing it
+ourselves makes the citation allow-list stronger.
 
 ---
 
 ## Verification
 
-Full log in [`docs/verification.md`](docs/verification.md). Summary:
-
-**Corrected during seed research.** The CASA security assessment fee was quoted
-in internal research at ~$540–$3,000 from a third party; Google's own
-documentation says **$500–$4,500**, so the first-party figure replaced it. A
-cited Nango URL now 404s and was relocated to its current address — citing a
-dead link would have been worse than not citing.
-
-**Deliberately left unverified.** Meta publishes no review SLA. Rather than
-quote an anecdotal community figure, that claim is marked `unverified` and the
-verdict says "Unknown" outright.
-
-**Agent output spot-checked.** The generated Zoom guide's claims were checked by
-fetching the cited page: access tokens expire after one hour ✅, refresh tokens
-after 90 days with rotation ✅, PKCE for loopback URIs ✅, deauthorization
-endpoint required ✅. No hallucination found.
-
-**All seed source URLs return 200** as of 2026-10-20.
+See [`docs/verification.md`](docs/verification.md) for the full log, including
+two corrections the seed research needed (Google's own documentation puts the
+CASA assessment fee at $500–$4,500, not the ~$540–$3,000 a third-party source
+claimed, and a cited URL had gone dead) and what was deliberately left
+unverified.
 
 ---
 
 ## Out of scope
 
 All 100 toolkits; user accounts or auth; actually completing any provider's
-approval process; and a browser-automation agent that registers OAuth apps on
-your behalf. Claims about what is "tested" cover only what a free account can
-reach — no app was submitted for Google verification or Meta review.
+approval process; and a browser-automation agent that registers OAuth apps.
+Claims about what is "tested" cover only what a free account can reach.
 
 ---
 
 ## What I'd do next
 
-**Scale the library without lowering the bar.** Batch-generate across many
-toolkits, then put a human review queue in front of publication — generated
-guides land as drafts and get promoted once their claims are spot-checked. The
-evidence model already makes that reviewable: a reviewer reads the claims, not
-the prose.
+**Spend the token budget better.** The 8k cap is the main quality constraint.
+Ranking page sections by relevance before trimming — rather than taking the first
+window that matches a keyword — would get more signal into the same budget, and
+is the most likely fix for missed blockers like the Zoom case above.
+
+**Scale the library with a review queue.** Batch-generate across toolkits, publish
+as drafts, promote once claims are spot-checked. The evidence model already makes
+that reviewable: a reviewer reads the claims, not the prose.
 
 **Freshness checks.** Every claim carries a URL and a check date, so a scheduled
-job could re-fetch sources, diff them, and flag guides whose evidence moved.
-Provider docs reorganise constantly — one source URL already died during this
-build.
+job could re-fetch sources, diff them, and flag guides whose evidence moved. One
+source URL already died during this build.
 
-**Use the Composio API for real scope data.** The managed-auth check already
-uses it when a key is present; the toolkit's default scopes could come from
-there too, so "do you need your own app?" compares the provider's scopes against
-Composio's actual defaults rather than reasoning about them.
-
-**A browser agent for the setup attempt.** The guides say what a human must do;
-an agent driving a real registration flow would turn `inferred` time estimates
-into `tested` ones, which is the one evidence status nothing currently earns.
-
-**Make the agent/human split verifiable.** Right now it is the model's judgement.
-Known provider patterns (anything behind a login, anything requiring payment)
-could be checked rather than assumed.
+**A browser agent for the setup attempt**, which would turn `inferred` time
+estimates into `tested` ones — the one evidence status nothing currently earns.
