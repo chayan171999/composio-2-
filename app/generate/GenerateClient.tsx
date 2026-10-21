@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import GuideView from "@/components/GuideView";
 import type { Guide } from "@/lib/schema";
 import type { ProgressEvent } from "@/lib/agent/types";
 
@@ -49,7 +50,12 @@ export default function GenerateClient({ query }: { query: string }) {
             const event = JSON.parse(payload) as ProgressEvent;
             if (event.type === "done") {
               setGuide(event.guide);
-              router.replace(`/guides/${event.guide.slug}`);
+              // Only hand off to the guide page when the guide is actually there.
+              // Redirecting to an unsaved slug lands the reader on a 404 right
+              // after watching it work.
+              if (event.saved !== false) {
+                router.replace(`/guides/${event.guide.slug}`);
+              }
             } else if (event.type === "error") {
               setError(event.message);
             } else if (event.type === "fetch") {
@@ -131,10 +137,9 @@ export default function GenerateClient({ query }: { query: string }) {
       )}
 
       {guide && (
-        <p className="mt-6 text-sm text-ink-3">
-          Done — opening{" "}
-          <span className="font-mono text-ink-2">/guides/{guide.slug}</span>…
-        </p>
+        <section className="mt-8 border-t border-edge pt-8">
+          <GuideView guide={guide} />
+        </section>
       )}
     </main>
   );

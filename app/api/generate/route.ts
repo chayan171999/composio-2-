@@ -37,14 +37,19 @@ export async function GET(request: Request) {
           // Persisting here rather than from the client keeps the store writable
           // only by the generator, so no one can POST an arbitrary guide into it.
           if (event.type === "done") {
+            let saved = true;
             try {
               await saveGuide(event.guide);
             } catch {
+              saved = false;
               send({
                 type: "warning",
-                message: "Could not save the guide — the URL will not be shareable.",
+                message:
+                  "No store configured, so this guide has no shareable URL — it is shown below instead.",
               });
             }
+            send({ ...event, saved });
+            continue;
           }
           send(event);
         }

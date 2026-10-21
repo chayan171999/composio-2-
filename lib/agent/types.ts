@@ -4,7 +4,7 @@ export type ProgressEvent =
   | { type: "stage"; message: string }
   | { type: "fetch"; url: string; ok?: boolean }
   | { type: "warning"; message: string }
-  | { type: "done"; guide: Guide }
+  | { type: "done"; guide: Guide; saved?: boolean }
   | { type: "error"; message: string };
 
 export type ComposioCheck = {
