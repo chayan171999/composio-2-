@@ -1,0 +1,12 @@
+# Vercel does not reliably honour .gitignore when uploading, and local test data
+# shipped into a deployment once: .data/guides.json overrode the committed guides,
+# so the live Zoom guide showed "no review" where the repo correctly says
+# "scope_review". Keep local-only state out of the bundle explicitly.
+.data
+.env
+.env.*
+!.env.example
+
+node_modules
+.next
+.git
